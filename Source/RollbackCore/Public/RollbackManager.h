@@ -66,6 +66,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Rollback")
     void RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame = -1);
 
+    // Fraction of the fixed step accumulated beyond the last simulated frame, clamped to [0,1].
+    // Render-side interpolation alpha; never read by the sim.
+    float GetFixedStepAlpha() const { return FMath::Clamp(Accumulator / FixedTimeStep, 0.0f, 1.0f); }
+
     UFUNCTION(BlueprintCallable, Category = "Rollback|Debug")
     void DrawDebugState(int32 Frame);
 
