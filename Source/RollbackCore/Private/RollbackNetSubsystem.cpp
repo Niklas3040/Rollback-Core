@@ -22,7 +22,12 @@ namespace RollbackNet
         Input = 2,
         Ack = 3,
         Heartbeat = 4,
+        Ping = 5,
+        Pong = 6,
     };
+
+    static constexpr double PingIntervalSeconds = 0.25;
+    static constexpr double LossWindowSeconds = 2.0;
 }
 
 void URollbackNetSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -165,6 +170,17 @@ bool URollbackNetSubsystem::ConnectToPeer(int32 PlayerId, const FString& RemoteH
     {
         OnTransportError.Broadcast(OutError);
         return false;
+    }
+
+    // One peer per endpoint: StartUdpPeer's auto-connect (PlayerId -1) followed by an explicit
+    // ConnectToPeer must not create a duplicate that double-sends every packet.
+    if (FRemotePeer* Existing = FindPeerByEndpoint(*Endpoint))
+    {
+        if (Existing->PlayerId < 0)
+        {
+            Existing->PlayerId = PlayerId;
+        }
+        return true;
     }
 
     FRemotePeer NewPeer;
@@ -375,11 +391,35 @@ TArray<FRollbackPeerInfo> URollbackNetSubsystem::GetAllPeerInfo() const
         Info.bIsConnected = Peer.bConnected;
         Info.LastActivitySecondsAgo = Peer.bConnected ? static_cast<float>(Now - Peer.LastActivityTime) : 0.0f;
         Info.RoundTripMs = Peer.LastRoundTripMs;
+        Info.PingMs = FMath::Max(0.0f, Peer.MeasuredPingMs);
+        Info.IncomingLossPercent = Peer.MeasuredIncomingLossPercent;
         Info.PacketsSentToPeer = Peer.PacketsSentToPeer;
         Info.PacketsReceivedFromPeer = Peer.PacketsReceivedFromPeer;
         Infos.Add(MoveTemp(Info));
     }
     return Infos;
+}
+
+bool URollbackNetSubsystem::GetMeasuredNetQuality(float& OutPingMs, float& OutIncomingLossPercent) const
+{
+    OutPingMs = 0.0f;
+    OutIncomingLossPercent = 0.0f;
+
+    bool bHasPingSample = false;
+    for (const FRemotePeer& Peer : Peers)
+    {
+        if (!Peer.bConnected)
+        {
+            continue;
+        }
+        if (Peer.MeasuredPingMs >= 0.0f)
+        {
+            OutPingMs = FMath::Max(OutPingMs, Peer.MeasuredPingMs);
+            bHasPingSample = true;
+        }
+        OutIncomingLossPercent = FMath::Max(OutIncomingLossPercent, Peer.MeasuredIncomingLossPercent);
+    }
+    return bHasPingSample;
 }
 
 void URollbackNetSubsystem::FlushTransport()
@@ -391,6 +431,7 @@ void URollbackNetSubsystem::FlushTransport()
     ResendReliablePackets(NowSeconds);
     CheckPeerTimeouts(NowSeconds);
     SendHeartbeats(NowSeconds);
+    UpdateNetQuality(NowSeconds);
     UpdatePerformanceStats(NowSeconds);
 
     for (FRemotePeer& Peer : Peers)
@@ -504,8 +545,20 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
     Peer->PacketsReceivedFromPeer++;
     Stats.LastReceivedSequence = Sequence;
 
+    // Unique-sequence bookkeeping feeds the incoming loss estimate; resends and duplicates must
+    // not count twice, and must be classified before MarkSequenceReceived mutates the set.
+    const bool bDuplicateSequence = Sequence == 0
+        || Sequence <= Peer->HighestContiguousReceivedSequence
+        || Peer->ReceivedSequences.Contains(Sequence);
+
     RemoveAckedPackets(*Peer, AckSequence, NowSeconds);
     MarkSequenceReceived(*Peer, Sequence);
+
+    if (!bDuplicateSequence)
+    {
+        Peer->LossTrackingHighestSequence = FMath::Max(Peer->LossTrackingHighestSequence, Sequence);
+        Peer->LossWindowPacketsReceived++;
+    }
 
     if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Hello))
     {
@@ -521,6 +574,34 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
 
     if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Ack))
     {
+        return;
+    }
+
+    if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Ping))
+    {
+        double EchoTimestampSeconds = 0.0;
+        Reader << EchoTimestampSeconds;
+        if (!Reader.IsError())
+        {
+            SendTimestampPacket(*Peer, static_cast<uint8>(RollbackNet::EWirePacketType::Pong), EchoTimestampSeconds);
+        }
+        return;
+    }
+
+    if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Pong))
+    {
+        // The echoed timestamp is our own clock, so NowSeconds - Echo is the true wire round trip,
+        // including any simulated latency on either side (delayed packets are processed late).
+        double EchoTimestampSeconds = 0.0;
+        Reader << EchoTimestampSeconds;
+        if (!Reader.IsError())
+        {
+            const float SampleMs = static_cast<float>((NowSeconds - EchoTimestampSeconds) * 1000.0);
+            if (SampleMs >= 0.0f)
+            {
+                Peer->MeasuredPingMs = Peer->MeasuredPingMs < 0.0f ? SampleMs : FMath::Lerp(Peer->MeasuredPingMs, SampleMs, 0.25f);
+            }
+        }
         return;
     }
 
@@ -649,6 +730,49 @@ void URollbackNetSubsystem::SendHeartbeats(double NowSeconds)
     }
 }
 
+void URollbackNetSubsystem::UpdateNetQuality(double NowSeconds)
+{
+    if (!Socket)
+    {
+        return;
+    }
+
+    for (FRemotePeer& Peer : Peers)
+    {
+        if (!Peer.bConnected)
+        {
+            continue;
+        }
+
+        if (NowSeconds - Peer.LastPingSentTime >= RollbackNet::PingIntervalSeconds)
+        {
+            Peer.LastPingSentTime = NowSeconds;
+            SendTimestampPacket(Peer, static_cast<uint8>(RollbackNet::EWirePacketType::Ping), NowSeconds);
+        }
+
+        if (Peer.LossWindowStartTime <= 0.0)
+        {
+            Peer.LossWindowStartTime = NowSeconds;
+            Peer.LossWindowBaseSequence = Peer.LossTrackingHighestSequence;
+            Peer.LossWindowPacketsReceived = 0;
+        }
+        else if (NowSeconds - Peer.LossWindowStartTime >= RollbackNet::LossWindowSeconds)
+        {
+            // Expected = span of sequence numbers the remote sent this window; anything missing
+            // from the unique-receive count was lost on the wire (or dropped by simulation).
+            const int64 Expected = static_cast<int64>(Peer.LossTrackingHighestSequence) - static_cast<int64>(Peer.LossWindowBaseSequence);
+            if (Expected > 0)
+            {
+                const int64 Lost = FMath::Clamp<int64>(Expected - Peer.LossWindowPacketsReceived, 0, Expected);
+                Peer.MeasuredIncomingLossPercent = 100.0f * static_cast<float>(Lost) / static_cast<float>(Expected);
+            }
+            Peer.LossWindowStartTime = NowSeconds;
+            Peer.LossWindowBaseSequence = Peer.LossTrackingHighestSequence;
+            Peer.LossWindowPacketsReceived = 0;
+        }
+    }
+}
+
 bool URollbackNetSubsystem::SendHello(FRemotePeer& Peer)
 {
     static const TArray<FNetworkInputFrame> EmptyInputs;
@@ -735,6 +859,35 @@ bool URollbackNetSubsystem::SendPacket(FRemotePeer& Peer, uint8 PacketType, cons
     return SendRawPacket(Payload, Peer.Endpoint.ToSharedRef(), true);
 }
 
+bool URollbackNetSubsystem::SendTimestampPacket(FRemotePeer& Peer, uint8 PacketType, double TimestampSeconds)
+{
+    if (!Peer.Endpoint.IsValid())
+    {
+        return false;
+    }
+
+    TArray<uint8> Payload;
+    FMemoryWriter Writer(Payload);
+
+    uint32 Magic = RollbackNet::PacketMagic;
+    uint8 Version = RollbackNet::PacketVersion;
+    uint32 Sequence = Peer.NextOutgoingSequence++;
+    uint32 AckSequence = Peer.HighestContiguousReceivedSequence;
+    int32 InputCount = 0;
+
+    Writer << Magic;
+    Writer << Version;
+    Writer << PacketType;
+    Writer << Sequence;
+    Writer << AckSequence;
+    Writer << InputCount;
+    Writer << TimestampSeconds;
+
+    Stats.LastSentSequence = Sequence;
+    Peer.PacketsSentToPeer++;
+    return SendRawPacket(Payload, Peer.Endpoint.ToSharedRef(), true);
+}
+
 bool URollbackNetSubsystem::SendRawPacket(const TArray<uint8>& Payload, TSharedRef<FInternetAddr> Destination, bool bApplySimulation)
 {
     if (!Socket)
@@ -799,7 +952,11 @@ void URollbackNetSubsystem::RemoveAckedPackets(FRemotePeer& Peer, uint32 AckSequ
         if (Pending.Key <= AckSequence)
         {
             AckedSequences.Add(Pending.Key);
-            Peer.LastRoundTripMs = static_cast<float>((NowSeconds - Pending.Value.LastSentSeconds) * 1000.0);
+            // Resends reset LastSentSeconds, so only first-attempt acks are valid RTT samples.
+            if (Pending.Value.SendAttempts == 1)
+            {
+                Peer.LastRoundTripMs = static_cast<float>((NowSeconds - Pending.Value.LastSentSeconds) * 1000.0);
+            }
         }
     }
 

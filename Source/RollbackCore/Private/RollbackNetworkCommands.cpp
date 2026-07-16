@@ -194,8 +194,9 @@ static FAutoConsoleCommandWithWorld CVarRollbackNetPeers(
 
         for (const FRollbackPeerInfo& Peer : Peers)
         {
-            LogRollbackNet(FString::Printf(TEXT("  Peer PlayerId=%d Endpoint=%s Connected=%s RTT=%.1fms Sent=%d Recv=%d Activity=%.1fs ago"),
+            LogRollbackNet(FString::Printf(TEXT("  Peer PlayerId=%d Endpoint=%s Connected=%s Ping=%.1fms Loss=%.1f%% ReliableRTT=%.1fms Sent=%d Recv=%d Activity=%.1fs ago"),
                 Peer.PlayerId, *Peer.EndpointString, Peer.bIsConnected ? TEXT("true") : TEXT("false"),
+                Peer.PingMs, Peer.IncomingLossPercent,
                 Peer.RoundTripMs, Peer.PacketsSentToPeer, Peer.PacketsReceivedFromPeer, Peer.LastActivitySecondsAgo));
         }
     })

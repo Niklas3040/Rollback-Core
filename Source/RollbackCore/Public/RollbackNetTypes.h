@@ -134,6 +134,14 @@ struct FRollbackPeerInfo
     UPROPERTY(BlueprintReadOnly, Category = "Rollback|Network")
     float RoundTripMs = 0.0f;
 
+    /** Measured wire round trip from the periodic ping/pong echo (0 until the first pong). */
+    UPROPERTY(BlueprintReadOnly, Category = "Rollback|Network")
+    float PingMs = 0.0f;
+
+    /** Incoming packet loss inferred from sequence gaps over the last measurement window. */
+    UPROPERTY(BlueprintReadOnly, Category = "Rollback|Network")
+    float IncomingLossPercent = 0.0f;
+
     UPROPERTY(BlueprintReadOnly, Category = "Rollback|Network")
     int32 PacketsSentToPeer = 0;
 

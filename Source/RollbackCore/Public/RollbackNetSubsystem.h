@@ -73,6 +73,11 @@ public:
     UFUNCTION(BlueprintPure, Category = "Rollback|Network")
     TArray<FRollbackPeerInfo> GetAllPeerInfo() const;
 
+    /** Worst measured wire round trip (periodic ping/pong echo) and incoming packet loss (sequence
+        gaps over a rolling window) across connected peers. Returns false until the first pong. */
+    UFUNCTION(BlueprintPure, Category = "Rollback|Network")
+    bool GetMeasuredNetQuality(float& OutPingMs, float& OutIncomingLossPercent) const;
+
     UFUNCTION(BlueprintCallable, Category = "Rollback|Network|Debug", meta = (DevelopmentOnly))
     void FlushTransport();
 
@@ -132,6 +137,13 @@ private:
         int32 PacketsSentToPeer = 0;
         int32 PacketsReceivedFromPeer = 0;
         double LastHeartbeatSentTime = 0.0;
+        double LastPingSentTime = 0.0;
+        float MeasuredPingMs = -1.0f;
+        float MeasuredIncomingLossPercent = 0.0f;
+        uint32 LossTrackingHighestSequence = 0;
+        uint32 LossWindowBaseSequence = 0;
+        int32 LossWindowPacketsReceived = 0;
+        double LossWindowStartTime = 0.0;
     };
 
     bool TickFunction(float DeltaTime);
@@ -142,12 +154,14 @@ private:
     void ResendReliablePackets(double NowSeconds);
     void CheckPeerTimeouts(double NowSeconds);
     void SendHeartbeats(double NowSeconds);
+    void UpdateNetQuality(double NowSeconds);
 
     bool SendHello(FRemotePeer& Peer);
     bool SendHeartbeat(FRemotePeer& Peer);
     bool SendAck(FRemotePeer& Peer);
     bool SendInputPacket(FRemotePeer& Peer, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable);
     bool SendPacket(FRemotePeer& Peer, uint8 PacketType, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable);
+    bool SendTimestampPacket(FRemotePeer& Peer, uint8 PacketType, double TimestampSeconds);
     bool SendRawPacket(const TArray<uint8>& Payload, TSharedRef<FInternetAddr> Destination, bool bApplySimulation);
     bool SendRawPacketNow(const TArray<uint8>& Payload, const FInternetAddr& Destination);
 
