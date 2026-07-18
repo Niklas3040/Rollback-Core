@@ -15,7 +15,7 @@
 namespace RollbackNet
 {
     static constexpr uint32 PacketMagic = 0x52424350; // RBCP
-    static constexpr uint8 PacketVersion = 1;
+    static constexpr uint8 PacketVersion = 2;
 
     enum class EWirePacketType : uint8
     {
@@ -26,6 +26,7 @@ namespace RollbackNet
         Ping = 5,
         Pong = 6,
         Checksum = 7,
+        GameMsg = 8,
     };
 
     // Frames of checksum history kept for cross-peer comparison.
@@ -33,6 +34,10 @@ namespace RollbackNet
 
     static constexpr double PingIntervalSeconds = 0.25;
     static constexpr double LossWindowSeconds = 2.0;
+
+    static constexpr int32 GameMessageChunkBytes = 1024;
+    static constexpr int32 MaxGameMessageBytes = 4 * 1024 * 1024;
+    static constexpr int32 MaxGameMessageChunks = MaxGameMessageBytes / GameMessageChunkBytes;
 }
 
 void URollbackNetSubsystem::Initialize(FSubsystemCollectionBase& Collection)
@@ -58,7 +63,10 @@ bool URollbackNetSubsystem::StartUdpPeer(const FRollbackTransportConfig& InConfi
     PerfStats = FRollbackPerformanceStats();
     Peers.Reset();
     RemoteInputBuffer.Reset();
+    NewestRemoteInputFrames.Reset();
     LocalInputHistory.Reset();
+    GameMessageAssemblies.Reset();
+    bLocalSimClockValid = false;
     DelayedIncomingPackets.Reset();
     DelayedOutgoingPackets.Reset();
     PerfSimulationTimes.Reset();
@@ -150,6 +158,7 @@ void URollbackNetSubsystem::StopTransport()
     SocketSubsystem = nullptr;
     DelayedIncomingPackets.Reset();
     DelayedOutgoingPackets.Reset();
+    GameMessageAssemblies.Reset();
 }
 
 bool URollbackNetSubsystem::ConnectToPeer(int32 PlayerId, const FString& RemoteHost, int32 RemotePort, FString& OutError)
@@ -292,6 +301,129 @@ bool URollbackNetSubsystem::ConsumeRemoteInput(int32 PlayerId, int32 Frame, FRol
 void URollbackNetSubsystem::BufferRemoteInputForRollback(int32 PlayerId, int32 Frame, FRollbackInput Input)
 {
     CacheRemoteInput(PlayerId, Frame, Input);
+}
+
+int32 URollbackNetSubsystem::GetNewestRemoteInputFrame(int32 PlayerId) const
+{
+    const int32* Newest = NewestRemoteInputFrames.Find(PlayerId);
+    return Newest ? *Newest : -1;
+}
+
+bool URollbackNetSubsystem::SendGameMessage(int32 PlayerId, uint8 MessageType, const TArray<uint8>& Data)
+{
+    FRemotePeer* Peer = FindPeerByPlayerId(PlayerId);
+    if (!Socket || !Peer || !Peer->bConnected || !Peer->Endpoint.IsValid() || Data.Num() > RollbackNet::MaxGameMessageBytes)
+    {
+        return false;
+    }
+
+    const uint32 MessageId = NextGameMessageId++;
+    const int32 ChunkCount = FMath::Max(1, FMath::DivideAndRoundUp(Data.Num(), RollbackNet::GameMessageChunkBytes));
+    const double NowSeconds = FPlatformTime::Seconds();
+
+    bool bAllSent = true;
+    for (int32 ChunkIndex = 0; ChunkIndex < ChunkCount; ++ChunkIndex)
+    {
+        const int32 Offset = ChunkIndex * RollbackNet::GameMessageChunkBytes;
+        const int32 ChunkBytes = FMath::Min(RollbackNet::GameMessageChunkBytes, Data.Num() - Offset);
+
+        TArray<uint8> Payload;
+        FMemoryWriter Writer(Payload);
+
+        uint32 Magic = RollbackNet::PacketMagic;
+        uint8 Version = RollbackNet::PacketVersion;
+        uint8 PacketType = static_cast<uint8>(RollbackNet::EWirePacketType::GameMsg);
+        uint32 Sequence = Peer->NextOutgoingSequence++;
+        uint32 AckSequence = Peer->HighestContiguousReceivedSequence;
+        int32 InputCount = 0;
+        uint32 MsgId = MessageId;
+        uint8 MsgType = MessageType;
+        int32 MsgChunkIndex = ChunkIndex;
+        int32 MsgChunkCount = ChunkCount;
+        int32 MsgChunkBytes = ChunkBytes;
+
+        Writer << Magic;
+        Writer << Version;
+        Writer << PacketType;
+        Writer << Sequence;
+        Writer << AckSequence;
+        Writer << InputCount;
+        Writer << MsgId;
+        Writer << MsgType;
+        Writer << MsgChunkIndex;
+        Writer << MsgChunkCount;
+        Writer << MsgChunkBytes;
+        if (ChunkBytes > 0)
+        {
+            Writer.Serialize(const_cast<uint8*>(Data.GetData() + Offset), ChunkBytes);
+        }
+
+        FPendingReliablePacket PendingPacket;
+        PendingPacket.Payload = Payload;
+        PendingPacket.Destination = Peer->Endpoint->Clone();
+        PendingPacket.LastSentSeconds = NowSeconds;
+        PendingPacket.SendAttempts = 1;
+        Peer->PendingReliable.Add(Sequence, MoveTemp(PendingPacket));
+
+        Stats.LastSentSequence = Sequence;
+        Peer->PacketsSentToPeer++;
+        if (!SendRawPacket(Payload, Peer->Endpoint.ToSharedRef(), true))
+        {
+            bAllSent = false;
+        }
+    }
+
+    return bAllSent;
+}
+
+void URollbackNetSubsystem::SetLocalSimClock(int32 Frame, float TickRateHz)
+{
+    LocalSimFrame = Frame;
+    if (TickRateHz > 0.0f)
+    {
+        LocalSimTickRateHz = TickRateHz;
+    }
+}
+
+void URollbackNetSubsystem::SetLocalSimClockValidForTimeSync(bool bValid)
+{
+    bLocalSimClockValid = bValid;
+
+    // Samples measured against the old clock (or against no clock) are meaningless now.
+    for (FRemotePeer& Peer : Peers)
+    {
+        Peer.bHasLeadSample = false;
+        Peer.LeadFramesSmoothed = 0.0f;
+    }
+}
+
+bool URollbackNetSubsystem::GetPeerLeadFrames(int32 PlayerId, float& OutLeadFrames) const
+{
+    OutLeadFrames = 0.0f;
+    for (const FRemotePeer& Peer : Peers)
+    {
+        if (Peer.PlayerId == PlayerId && Peer.bConnected && Peer.bHasLeadSample)
+        {
+            OutLeadFrames = Peer.LeadFramesSmoothed;
+            return true;
+        }
+    }
+    return false;
+}
+
+void URollbackNetSubsystem::UpdatePeerLeadSample(FRemotePeer& Peer, int32 RemoteFrame, float RoundTripMs)
+{
+    // -1 stamps mean the remote clock is not yet on the shared timeline (joiner mid-rebase);
+    // an invalid local clock makes the comparison equally meaningless.
+    if (RemoteFrame < 0 || RoundTripMs < 0.0f || !bLocalSimClockValid)
+    {
+        return;
+    }
+
+    const float HalfRttFrames = 0.5f * RoundTripMs * LocalSimTickRateHz / 1000.0f;
+    const float Sample = (static_cast<float>(RemoteFrame) + HalfRttFrames) - static_cast<float>(LocalSimFrame);
+    Peer.LeadFramesSmoothed = Peer.bHasLeadSample ? 0.6f * Peer.LeadFramesSmoothed + 0.4f * Sample : Sample;
+    Peer.bHasLeadSample = true;
 }
 
 void URollbackNetSubsystem::ApplyBufferedInputsToState(URollbackStateComponent* StateComponent, int32 PlayerId, int32 FromFrame, int32 ToFrame, bool& bOutChanged, int32& OutEarliestChangedFrame)
@@ -593,10 +725,13 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
     if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Ping))
     {
         double EchoTimestampSeconds = 0.0;
+        int32 RemoteSimFrame = -1;
         Reader << EchoTimestampSeconds;
+        Reader << RemoteSimFrame;
         if (!Reader.IsError())
         {
             SendTimestampPacket(*Peer, static_cast<uint8>(RollbackNet::EWirePacketType::Pong), EchoTimestampSeconds);
+            UpdatePeerLeadSample(*Peer, RemoteSimFrame, Peer->MeasuredPingMs);
         }
         return;
     }
@@ -606,13 +741,16 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
         // The echoed timestamp is our own clock, so NowSeconds - Echo is the true wire round trip,
         // including any simulated latency on either side (delayed packets are processed late).
         double EchoTimestampSeconds = 0.0;
+        int32 RemoteSimFrame = -1;
         Reader << EchoTimestampSeconds;
+        Reader << RemoteSimFrame;
         if (!Reader.IsError())
         {
             const float SampleMs = static_cast<float>((NowSeconds - EchoTimestampSeconds) * 1000.0);
             if (SampleMs >= 0.0f)
             {
                 Peer->MeasuredPingMs = Peer->MeasuredPingMs < 0.0f ? SampleMs : FMath::Lerp(Peer->MeasuredPingMs, SampleMs, 0.25f);
+                UpdatePeerLeadSample(*Peer, RemoteSimFrame, SampleMs);
             }
         }
         return;
@@ -633,8 +771,23 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
         return;
     }
 
+    if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::GameMsg))
+    {
+        Peer->bAckDirty = true;
+        // A reliable resend carries the exact sequence already processed; reprocessing it could
+        // re-open a completed assembly and double-deliver the message.
+        if (!bDuplicateSequence)
+        {
+            ProcessGameMessageChunk(*Peer, Reader, Sender->ToString(true));
+        }
+        return;
+    }
+
     if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Input))
     {
+        // Cache the whole packet before any delegate fires: a listener reacting to the packet's
+        // oldest redundancy frame (e.g. a timeline rebase) must already see the newest one.
+        TArray<FNetworkInputFrame, TInlineAllocator<64>> PacketFrames;
         for (int32 Index = 0; Index < InputCount; ++Index)
         {
             FNetworkInputFrame InputFrame;
@@ -660,11 +813,85 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
                 Peer->PlayerId = InputFrame.PlayerId;
             }
 
-            CacheRemoteInput(InputFrame.PlayerId, InputFrame.Frame, InputFrame.Input);
+            PacketFrames.Add(InputFrame);
         }
 
         Peer->bAckDirty = true;
+
+        TArray<bool, TInlineAllocator<64>> bFrameChanged;
+        for (const FNetworkInputFrame& InputFrame : PacketFrames)
+        {
+            bFrameChanged.Add(CacheRemoteInputSilent(InputFrame.PlayerId, InputFrame.Frame, InputFrame.Input));
+        }
+        for (int32 Index = 0; Index < PacketFrames.Num(); ++Index)
+        {
+            if (bFrameChanged[Index])
+            {
+                const FNetworkInputFrame& InputFrame = PacketFrames[Index];
+                OnRemoteInputReceived.Broadcast(InputFrame.PlayerId, InputFrame.Frame, InputFrame.Input);
+            }
+        }
     }
+}
+
+void URollbackNetSubsystem::ProcessGameMessageChunk(FRemotePeer& Peer, FMemoryReader& Reader, const FString& PeerKey)
+{
+    uint32 MessageId = 0;
+    uint8 MessageType = 0;
+    int32 ChunkIndex = -1;
+    int32 ChunkCount = 0;
+    int32 ChunkBytes = -1;
+
+    Reader << MessageId;
+    Reader << MessageType;
+    Reader << ChunkIndex;
+    Reader << ChunkCount;
+    Reader << ChunkBytes;
+
+    if (Reader.IsError()
+        || ChunkCount < 1 || ChunkCount > RollbackNet::MaxGameMessageChunks
+        || ChunkIndex < 0 || ChunkIndex >= ChunkCount
+        || ChunkBytes < 0 || ChunkBytes > RollbackNet::GameMessageChunkBytes
+        || Reader.TotalSize() - Reader.Tell() < ChunkBytes)
+    {
+        return;
+    }
+
+    TArray<uint8> ChunkData;
+    ChunkData.SetNumUninitialized(ChunkBytes);
+    if (ChunkBytes > 0)
+    {
+        Reader.Serialize(ChunkData.GetData(), ChunkBytes);
+    }
+
+    FGameMessageAssembly& Assembly = GameMessageAssemblies.FindOrAdd(PeerKey).FindOrAdd(MessageId);
+    if (Assembly.ChunkCount == 0)
+    {
+        Assembly.MessageType = MessageType;
+        Assembly.ChunkCount = ChunkCount;
+    }
+    else if (Assembly.MessageType != MessageType || Assembly.ChunkCount != ChunkCount)
+    {
+        return;
+    }
+    Assembly.Chunks.Add(ChunkIndex, MoveTemp(ChunkData));
+
+    if (Assembly.Chunks.Num() < Assembly.ChunkCount)
+    {
+        return;
+    }
+
+    TArray<uint8> FullData;
+    for (int32 Index = 0; Index < Assembly.ChunkCount; ++Index)
+    {
+        FullData.Append(Assembly.Chunks.FindChecked(Index));
+    }
+    GameMessageAssemblies.FindChecked(PeerKey).Remove(MessageId);
+
+    // Broadcast last: handlers may connect peers and reallocate the peer array.
+    const int32 SenderPlayerId = Peer.PlayerId;
+    OnGameMessageReceived.Broadcast(SenderPlayerId, MessageType, FullData);
+    OnGameMessageReceivedNative.Broadcast(SenderPlayerId, MessageType, FullData);
 }
 
 void URollbackNetSubsystem::ReleaseDelayedIncoming(double NowSeconds)
@@ -993,6 +1220,9 @@ bool URollbackNetSubsystem::SendTimestampPacket(FRemotePeer& Peer, uint8 PacketT
     uint32 AckSequence = Peer.HighestContiguousReceivedSequence;
     int32 InputCount = 0;
 
+    // -1 marks a clock that is not yet on the shared timeline; receivers skip the lead sample.
+    int32 SimFrame = bLocalSimClockValid ? LocalSimFrame : -1;
+
     Writer << Magic;
     Writer << Version;
     Writer << PacketType;
@@ -1000,6 +1230,7 @@ bool URollbackNetSubsystem::SendTimestampPacket(FRemotePeer& Peer, uint8 PacketT
     Writer << AckSequence;
     Writer << InputCount;
     Writer << TimestampSeconds;
+    Writer << SimFrame;
 
     Stats.LastSentSequence = Sequence;
     Peer.PacketsSentToPeer++;
@@ -1098,16 +1329,27 @@ void URollbackNetSubsystem::RemoveAckedPackets(FRemotePeer& Peer, uint32 AckSequ
 
 void URollbackNetSubsystem::CacheRemoteInput(int32 PlayerId, int32 Frame, const FRollbackInput& Input)
 {
+    if (CacheRemoteInputSilent(PlayerId, Frame, Input))
+    {
+        OnRemoteInputReceived.Broadcast(PlayerId, Frame, Input);
+    }
+}
+
+bool URollbackNetSubsystem::CacheRemoteInputSilent(int32 PlayerId, int32 Frame, const FRollbackInput& Input)
+{
     TMap<int32, FRollbackInput>& PlayerInputs = RemoteInputBuffer.FindOrAdd(PlayerId);
     const FRollbackInput* ExistingInput = PlayerInputs.Find(Frame);
-    if (!ExistingInput || *ExistingInput != Input)
+    const bool bChanged = !ExistingInput || *ExistingInput != Input;
+    if (bChanged)
     {
         PlayerInputs.Add(Frame, Input);
         Stats.LastReceivedFrame = FMath::Max(Stats.LastReceivedFrame, Frame);
-        OnRemoteInputReceived.Broadcast(PlayerId, Frame, Input);
+        int32& NewestFrame = NewestRemoteInputFrames.FindOrAdd(PlayerId, -1);
+        NewestFrame = FMath::Max(NewestFrame, Frame);
     }
 
     PlayerInputs.Remove(Frame - 600);
+    return bChanged;
 }
 
 URollbackNetSubsystem::FRemotePeer* URollbackNetSubsystem::FindPeerByEndpoint(const FInternetAddr& Addr)

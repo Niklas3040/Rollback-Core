@@ -71,9 +71,20 @@ void URollbackManager::Tick(float DeltaTime)
     Accumulator += DeltaTime;
     while (Accumulator >= FixedTimeStep)
     {
-        AdvanceFrame();
         Accumulator -= FixedTimeStep;
+        if (PendingTimeSyncStallFrames > 0)
+        {
+            PendingTimeSyncStallFrames--;
+            TimeSyncStalledFrameCount++;
+            continue;
+        }
+        AdvanceFrame();
     }
+}
+
+void URollbackManager::RequestTimeSyncStall(int32 Frames)
+{
+    PendingTimeSyncStallFrames = FMath::Clamp(PendingTimeSyncStallFrames + Frames, 0, MaxPendingTimeSyncStallFrames);
 }
 
 void URollbackManager::RegisterEntity(TScriptInterface<IRollbackEntity> Entity)
@@ -127,6 +138,11 @@ void URollbackManager::AdvanceFrame()
     CurrentFrame++;
 
     URollbackNetSubsystem* Net = GetWorld() ? GetWorld()->GetSubsystem<URollbackNetSubsystem>() : nullptr;
+
+    if (Net)
+    {
+        Net->SetLocalSimClock(CurrentFrame, FixedTimeStep > 0.0f ? 1.0f / FixedTimeStep : 60.0f);
+    }
 
     // Stream the checksum of the newest frame old enough that no rollback can rewrite it.
     const int32 FinalizedFrame = CurrentFrame - StateChecksumLagFrames;

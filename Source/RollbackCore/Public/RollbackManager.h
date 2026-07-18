@@ -66,6 +66,14 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Rollback")
     void RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame = -1);
 
+    // Time sync: skip the next N fixed steps so a peer running ahead of the others can fall
+    // back in line. Wall time keeps accumulating; only the sim pauses.
+    UFUNCTION(BlueprintCallable, Category = "Rollback|TimeSync")
+    void RequestTimeSyncStall(int32 Frames);
+
+    UPROPERTY(BlueprintReadOnly, Category = "Rollback|TimeSync")
+    int32 TimeSyncStalledFrameCount = 0;
+
     // Fraction of the fixed step accumulated beyond the last simulated frame, clamped to [0,1].
     // Render-side interpolation alpha; never read by the sim.
     float GetFixedStepAlpha() const { return FMath::Clamp(Accumulator / FixedTimeStep, 0.0f, 1.0f); }
@@ -167,6 +175,11 @@ private:
     float Accumulator = 0.0f;
     float FixedTimeStep = 1.0f / 60.0f;
     bool bIsReplayingRollback = false;
+    int32 PendingTimeSyncStallFrames = 0;
+
+    // Backstop against a runaway caller freezing the sim; the per-decision pacing lives with
+    // whoever calls RequestTimeSyncStall.
+    static constexpr int32 MaxPendingTimeSyncStallFrames = 8;
 
     // Frames a state must age before its checksum goes on the wire. Must exceed the
     // deepest input correction the game performs and stay under the snapshot buffer size.

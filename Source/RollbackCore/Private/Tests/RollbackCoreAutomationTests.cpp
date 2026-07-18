@@ -492,4 +492,185 @@ bool FRollbackPerformanceStatsTest::RunTest(const FString& Parameters)
     return true;
 }
 
+// A multi-chunk reliable game message reassembles byte-identically on the remote peer.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRollbackGameMessageChunkingTest, "RollbackCore.Network.GameMessageChunking", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRollbackGameMessageChunkingTest::RunTest(const FString& Parameters)
+{
+    UWorld* WorldA = RollbackCore::Tests::CreateTestWorld();
+    UWorld* WorldB = RollbackCore::Tests::CreateTestWorld();
+    ON_SCOPE_EXIT
+    {
+        RollbackCore::Tests::DestroyTestWorld(WorldB);
+        RollbackCore::Tests::DestroyTestWorld(WorldA);
+    };
+
+    URollbackNetSubsystem* NetA = WorldA->GetSubsystem<URollbackNetSubsystem>();
+    URollbackNetSubsystem* NetB = WorldB->GetSubsystem<URollbackNetSubsystem>();
+    if (!NetA || !NetB)
+    {
+        AddError(TEXT("Net subsystems missing"));
+        return false;
+    }
+
+    const int32 BasePort = 26000 + FMath::RandRange(0, 2000);
+    FRollbackTransportConfig ConfigA;
+    ConfigA.LocalPort = BasePort;
+    FRollbackTransportConfig ConfigB;
+    ConfigB.LocalPort = BasePort + 1;
+
+    FString Error;
+    TestTrue(TEXT("A transport starts"), NetA->StartUdpPeer(ConfigA, Error));
+    TestTrue(TEXT("B transport starts"), NetB->StartUdpPeer(ConfigB, Error));
+    TestTrue(TEXT("A connects to B"), NetA->ConnectToPeer(2, TEXT("127.0.0.1"), BasePort + 1, Error));
+    TestTrue(TEXT("B connects to A"), NetB->ConnectToPeer(1, TEXT("127.0.0.1"), BasePort, Error));
+
+    // Deterministic 5000-byte pattern spanning multiple chunks.
+    TArray<uint8> Sent;
+    Sent.SetNum(5000);
+    for (int32 Index = 0; Index < Sent.Num(); ++Index)
+    {
+        Sent[Index] = static_cast<uint8>((Index * 31 + 7) & 0xFF);
+    }
+
+    int32 ReceivedFromPlayerId = -1;
+    uint8 ReceivedType = 0;
+    TArray<uint8> Received;
+    int32 ReceiveCount = 0;
+    NetB->OnGameMessageReceivedNative.AddLambda(
+        [&](int32 PlayerId, uint8 MessageType, const TArray<uint8>& Data)
+        {
+            ReceivedFromPlayerId = PlayerId;
+            ReceivedType = MessageType;
+            Received = Data;
+            ReceiveCount++;
+        });
+
+    TestTrue(TEXT("Game message send succeeds"), NetA->SendGameMessage(2, 42, Sent));
+
+    for (int32 Attempt = 0; Attempt < 100 && ReceiveCount == 0; ++Attempt)
+    {
+        FPlatformProcess::Sleep(0.01f);
+        NetA->FlushTransport();
+        NetB->FlushTransport();
+    }
+
+    // Extra pumps: reliable resends of already-delivered chunks must not double-deliver.
+    for (int32 Attempt = 0; Attempt < 20; ++Attempt)
+    {
+        FPlatformProcess::Sleep(0.01f);
+        NetA->FlushTransport();
+        NetB->FlushTransport();
+    }
+
+    TestEqual(TEXT("Message delivered exactly once"), ReceiveCount, 1);
+    TestEqual(TEXT("Sender resolved to the dialed player id"), ReceivedFromPlayerId, 1);
+    TestEqual(TEXT("Message type preserved"), static_cast<int32>(ReceivedType), 42);
+    TestTrue(TEXT("Payload reassembled byte-identically"), Received == Sent);
+    return true;
+}
+
+// Peers with skewed sim clocks measure each other's frame lead, latency-compensated;
+// invalid clocks produce no sample at all.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRollbackTimeSyncLeadMeasurementTest, "RollbackCore.Network.TimeSyncLeadMeasurement", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRollbackTimeSyncLeadMeasurementTest::RunTest(const FString& Parameters)
+{
+    UWorld* WorldA = RollbackCore::Tests::CreateTestWorld();
+    UWorld* WorldB = RollbackCore::Tests::CreateTestWorld();
+    ON_SCOPE_EXIT
+    {
+        RollbackCore::Tests::DestroyTestWorld(WorldB);
+        RollbackCore::Tests::DestroyTestWorld(WorldA);
+    };
+
+    URollbackNetSubsystem* NetA = WorldA->GetSubsystem<URollbackNetSubsystem>();
+    URollbackNetSubsystem* NetB = WorldB->GetSubsystem<URollbackNetSubsystem>();
+    if (!NetA || !NetB)
+    {
+        AddError(TEXT("Net subsystems missing"));
+        return false;
+    }
+
+    const int32 BasePort = 28100 + FMath::RandRange(0, 2000);
+    FRollbackTransportConfig ConfigA;
+    ConfigA.LocalPort = BasePort;
+    FRollbackTransportConfig ConfigB;
+    ConfigB.LocalPort = BasePort + 1;
+
+    FString Error;
+    TestTrue(TEXT("A transport starts"), NetA->StartUdpPeer(ConfigA, Error));
+    TestTrue(TEXT("B transport starts"), NetB->StartUdpPeer(ConfigB, Error));
+    TestTrue(TEXT("A connects to B"), NetA->ConnectToPeer(2, TEXT("127.0.0.1"), BasePort + 1, Error));
+    TestTrue(TEXT("B connects to A"), NetB->ConnectToPeer(1, TEXT("127.0.0.1"), BasePort, Error));
+
+    // B's clock invalid: A must never obtain a lead sample for it.
+    NetA->SetLocalSimClock(1000, 60.0f);
+    NetA->SetLocalSimClockValidForTimeSync(true);
+    NetB->SetLocalSimClock(900, 60.0f);
+    NetB->SetLocalSimClockValidForTimeSync(false);
+
+    for (int32 Attempt = 0; Attempt < 60; ++Attempt)
+    {
+        FPlatformProcess::Sleep(0.01f);
+        NetA->FlushTransport();
+        NetB->FlushTransport();
+    }
+
+    float Lead = 0.0f;
+    TestFalse(TEXT("Invalid remote clock yields no sample"), NetA->GetPeerLeadFrames(2, Lead));
+
+    NetB->SetLocalSimClockValidForTimeSync(true);
+    bool bAHasSample = false;
+    bool bBHasSample = false;
+    float LeadOfBSeenByA = 0.0f;
+    float LeadOfASeenByB = 0.0f;
+    for (int32 Attempt = 0; Attempt < 300 && !(bAHasSample && bBHasSample); ++Attempt)
+    {
+        FPlatformProcess::Sleep(0.01f);
+        NetA->FlushTransport();
+        NetB->FlushTransport();
+        bAHasSample = NetA->GetPeerLeadFrames(2, LeadOfBSeenByA);
+        bBHasSample = NetB->GetPeerLeadFrames(1, LeadOfASeenByB);
+    }
+
+    TestTrue(TEXT("A measured B's lead"), bAHasSample);
+    TestTrue(TEXT("B measured A's lead"), bBHasSample);
+    // Loopback RTT is near zero, so the raw 100-frame offset must show through cleanly.
+    TestTrue(FString::Printf(TEXT("B is ~100 frames behind seen from A (got %.1f)"), LeadOfBSeenByA),
+        FMath::Abs(LeadOfBSeenByA + 100.0f) < 5.0f);
+    TestTrue(FString::Printf(TEXT("A is ~100 frames ahead seen from B (got %.1f)"), LeadOfASeenByB),
+        FMath::Abs(LeadOfASeenByB - 100.0f) < 5.0f);
+    return true;
+}
+
+// RequestTimeSyncStall consumes fixed steps without advancing the sim.
+IMPLEMENT_SIMPLE_AUTOMATION_TEST(FRollbackTimeSyncStallTest, "RollbackCore.Rollback.TimeSyncStall", EAutomationTestFlags::EditorContext | EAutomationTestFlags::EngineFilter)
+
+bool FRollbackTimeSyncStallTest::RunTest(const FString& Parameters)
+{
+    UWorld* World = RollbackCore::Tests::CreateTestWorld();
+    ON_SCOPE_EXIT { RollbackCore::Tests::DestroyTestWorld(World); };
+
+    URollbackManager* Manager = World->GetSubsystem<URollbackManager>();
+    if (!Manager)
+    {
+        AddError(TEXT("Manager missing"));
+        return false;
+    }
+
+    const int32 StartFrame = Manager->CurrentFrame;
+    const float FixedStep = 1.0f / 60.0f;
+
+    Manager->RequestTimeSyncStall(2);
+    Manager->Tick(4.0f * FixedStep + 0.0001f);
+
+    TestEqual(TEXT("Two of four steps were stalled"), Manager->CurrentFrame, StartFrame + 2);
+    TestEqual(TEXT("Stall counter tracked both"), Manager->TimeSyncStalledFrameCount, 2);
+
+    Manager->Tick(2.0f * FixedStep);
+    TestEqual(TEXT("Normal stepping resumed"), Manager->CurrentFrame, StartFrame + 4);
+    return true;
+}
+
 #endif // WITH_DEV_AUTOMATION_TESTS

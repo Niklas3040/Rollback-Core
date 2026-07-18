@@ -9,6 +9,7 @@
 #include "RollbackNetSubsystem.generated.h"
 
 class FInternetAddr;
+class FMemoryReader;
 class FSocket;
 class ISocketSubsystem;
 class URollbackStateComponent;
@@ -19,6 +20,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRollbackRemoteInputReceivedSigna
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FRollbackPeerDisconnectedSignature, int32, PlayerId, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FRollbackPeerMaxRetriesSignature, int32, PlayerId, int32, FailedSequence);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRollbackChecksumMismatchSignature, int32, Frame, int32, LocalChecksum, int32, RemoteChecksum);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRollbackGameMessageSignature, int32, PlayerId, uint8, MessageType, const TArray<uint8>&, Data);
 
 UCLASS()
 class ROLLBACKCORE_API URollbackNetSubsystem : public UWorldSubsystem
@@ -50,6 +52,15 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Rollback|Network")
     void BufferRemoteInputForRollback(int32 PlayerId, int32 Frame, FRollbackInput Input);
 
+    /** Highest input frame received from a remote player, or -1 before any input arrived. */
+    UFUNCTION(BlueprintPure, Category = "Rollback|Network")
+    int32 GetNewestRemoteInputFrame(int32 PlayerId) const;
+
+    /** Reliable app-level message to one peer; payloads above the packet size are chunked and
+        reassembled before OnGameMessageReceived fires on the remote side. */
+    UFUNCTION(BlueprintCallable, Category = "Rollback|Network")
+    bool SendGameMessage(int32 PlayerId, uint8 MessageType, const TArray<uint8>& Data);
+
     UFUNCTION(BlueprintCallable, Category = "Rollback|Network")
     void ApplyBufferedInputsToState(URollbackStateComponent* StateComponent, int32 PlayerId, int32 FromFrame, int32 ToFrame, bool& bOutChanged, int32& OutEarliestChangedFrame);
 
@@ -78,6 +89,19 @@ public:
         gaps over a rolling window) across connected peers. Returns false until the first pong. */
     UFUNCTION(BlueprintPure, Category = "Rollback|Network")
     bool GetMeasuredNetQuality(float& OutPingMs, float& OutIncomingLossPercent) const;
+
+    /** Local sim clock stamped into ping/pong traffic so peers can measure frame lead.
+        Call every simulated frame. */
+    void SetLocalSimClock(int32 Frame, float TickRateHz);
+
+    /** While false the local clock is stamped as invalid (a joiner mid-rebase has no meaningful
+        frame number) and incoming lead samples are discarded. Toggling clears stored samples. */
+    void SetLocalSimClockValidForTimeSync(bool bValid);
+
+    /** Smoothed frames the peer's sim clock runs ahead of ours, latency-compensated
+        (negative = the peer is behind). False until both clocks are valid and measured. */
+    UFUNCTION(BlueprintPure, Category = "Rollback|TimeSync")
+    bool GetPeerLeadFrames(int32 PlayerId, float& OutLeadFrames) const;
 
     UFUNCTION(BlueprintCallable, Category = "Rollback|Network|Debug", meta = (DevelopmentOnly))
     void FlushTransport();
@@ -111,6 +135,13 @@ public:
     /** Fired when a finalized frame's state checksum differs from the peer's — a confirmed cross-peer desync. */
     UPROPERTY(BlueprintAssignable, Category = "Rollback|Desync")
     FRollbackChecksumMismatchSignature OnStateChecksumMismatch;
+
+    /** Fired once per fully reassembled game message. */
+    UPROPERTY(BlueprintAssignable, Category = "Rollback|Network")
+    FRollbackGameMessageSignature OnGameMessageReceived;
+
+    /** Native mirror of OnGameMessageReceived for non-UObject listeners (tests). */
+    TMulticastDelegate<void(int32 /*PlayerId*/, uint8 /*MessageType*/, const TArray<uint8>& /*Data*/)> OnGameMessageReceivedNative;
 
 private:
     struct FPendingReliablePacket
@@ -157,6 +188,15 @@ private:
         uint32 LossWindowBaseSequence = 0;
         int32 LossWindowPacketsReceived = 0;
         double LossWindowStartTime = 0.0;
+        float LeadFramesSmoothed = 0.0f;
+        bool bHasLeadSample = false;
+    };
+
+    struct FGameMessageAssembly
+    {
+        uint8 MessageType = 0;
+        int32 ChunkCount = 0;
+        TMap<int32, TArray<uint8>> Chunks;
     };
 
     bool TickFunction(float DeltaTime);
@@ -177,12 +217,15 @@ private:
     void CompareStateChecksums(int32 Frame);
     bool SendPacket(FRemotePeer& Peer, uint8 PacketType, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable);
     bool SendTimestampPacket(FRemotePeer& Peer, uint8 PacketType, double TimestampSeconds);
+    void UpdatePeerLeadSample(FRemotePeer& Peer, int32 RemoteFrame, float RoundTripMs);
+    void ProcessGameMessageChunk(FRemotePeer& Peer, FMemoryReader& Reader, const FString& PeerKey);
     bool SendRawPacket(const TArray<uint8>& Payload, TSharedRef<FInternetAddr> Destination, bool bApplySimulation);
     bool SendRawPacketNow(const TArray<uint8>& Payload, const FInternetAddr& Destination);
 
     void MarkSequenceReceived(FRemotePeer& Peer, uint32 Sequence);
     void RemoveAckedPackets(FRemotePeer& Peer, uint32 AckSequence, double NowSeconds);
     void CacheRemoteInput(int32 PlayerId, int32 Frame, const FRollbackInput& Input);
+    bool CacheRemoteInputSilent(int32 PlayerId, int32 Frame, const FRollbackInput& Input);
 
     FRemotePeer* FindPeerByEndpoint(const FInternetAddr& Addr);
     FRemotePeer* FindPeerByPlayerId(int32 PlayerId);
@@ -207,7 +250,13 @@ private:
     TArray<FRemotePeer> Peers;
 
     TMap<int32, TMap<int32, FRollbackInput>> RemoteInputBuffer;
+    TMap<int32, int32> NewestRemoteInputFrames;
     TMap<int32, FRollbackInput> LocalInputHistory;
+    TMap<FString, TMap<uint32, FGameMessageAssembly>> GameMessageAssemblies;
+    uint32 NextGameMessageId = 1;
+    int32 LocalSimFrame = 0;
+    float LocalSimTickRateHz = 60.0f;
+    bool bLocalSimClockValid = false;
     TMap<int32, uint32> LocalStateChecksums;
     TMap<int32, uint32> RemoteStateChecksums;
     int32 ChecksumMinValidFrame = 0;
