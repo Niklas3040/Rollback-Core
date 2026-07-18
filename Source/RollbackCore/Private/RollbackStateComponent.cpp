@@ -131,7 +131,20 @@ void URollbackStateComponent::LoadRollbackState(int32 Frame)
         AActor* Owner = GetOwner();
         if (Owner)
         {
-            Owner->SetActorLocationAndRotation(State.Location, State.Rotation);
+            // MoveComponent-based setters store Current + (Target - Current), which loses low
+            // bits depending on where the actor happens to be right now; restores must be
+            // bit-exact or every rollback diverges from a straight-line simulation.
+            USceneComponent* Root = Owner->GetRootComponent();
+            if (Root && !Root->GetAttachParent())
+            {
+                Root->SetRelativeLocation_Direct(State.Location);
+                Root->SetRelativeRotation_Direct(State.Rotation.Rotator());
+                Root->UpdateComponentToWorld();
+            }
+            else
+            {
+                Owner->SetActorLocationAndRotation(State.Location, State.Rotation);
+            }
             LoadActorVariables(State.ActorData);
             LastRestoredFrame = Frame;
             LastRestoredByteCount = State.ActorData.Num();

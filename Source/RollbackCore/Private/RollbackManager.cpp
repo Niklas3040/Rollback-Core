@@ -5,10 +5,26 @@
 #include "DrawDebugHelpers.h"
 #include "Engine/World.h"
 #include "GameFramework/Actor.h"
+#include "GameFramework/PlayerController.h"
 #include "Misc/Crc.h"
+#include "RollbackCore.h"
 #include "RollbackCoreSettings.h"
 #include "RollbackDemoEnvironment.h"
 #include "RollbackNetSubsystem.h"
+
+// Entities register either as a URollbackStateComponent or as an actor owning one.
+static const URollbackStateComponent* ResolveStateComp(const TScriptInterface<IRollbackEntity>& Entity)
+{
+    if (const URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject()))
+    {
+        return StateComp;
+    }
+    if (const AActor* Actor = Cast<AActor>(Entity.GetObject()))
+    {
+        return Actor->FindComponentByClass<URollbackStateComponent>();
+    }
+    return nullptr;
+}
 
 void URollbackManager::Initialize(FSubsystemCollectionBase& Collection)
 {
@@ -22,6 +38,12 @@ void URollbackManager::Initialize(FSubsystemCollectionBase& Collection)
             : 1.0f / 60.0f;
         bEnableVisualDebugging = Settings->bEnableVisualDebuggingByDefault;
         DebugLiveFrameLag = Settings->DebugLiveFrameLag;
+    }
+
+    Collection.InitializeDependency(URollbackNetSubsystem::StaticClass());
+    if (URollbackNetSubsystem* Net = GetWorld() ? GetWorld()->GetSubsystem<URollbackNetSubsystem>() : nullptr)
+    {
+        Net->OnStateChecksumMismatch.AddDynamic(this, &URollbackManager::HandleStateChecksumMismatch);
     }
 
     TickHandle = FTSTicker::GetCoreTicker().AddTicker(FTickerDelegate::CreateUObject(this, &URollbackManager::TickFunction));
@@ -41,6 +63,11 @@ bool URollbackManager::TickFunction(float DeltaTime)
 
 void URollbackManager::Tick(float DeltaTime)
 {
+    if (bHaltedOnDesync)
+    {
+        return;
+    }
+
     Accumulator += DeltaTime;
     while (Accumulator >= FixedTimeStep)
     {
@@ -98,6 +125,23 @@ void URollbackManager::AdvanceFrame()
         DebugScrubFrame = FMath::Max(0, CurrentFrame - DebugLiveFrameLag);
     }
     CurrentFrame++;
+
+    URollbackNetSubsystem* Net = GetWorld() ? GetWorld()->GetSubsystem<URollbackNetSubsystem>() : nullptr;
+
+    // Stream the checksum of the newest frame old enough that no rollback can rewrite it.
+    const int32 FinalizedFrame = CurrentFrame - StateChecksumLagFrames;
+    if (Net && FinalizedFrame >= 0 && Net->IsTransportRunning() && Net->IsConnectedToPeer())
+    {
+        Net->SubmitLocalStateChecksum(FinalizedFrame, ComputeStateChecksum(FinalizedFrame));
+    }
+
+    if (CurrentFrame % TelemetryLogIntervalFrames == 0 && RegisteredEntities.Num() > 0)
+    {
+        UE_LOG(LogRollbackCore, Display, TEXT("f=%d entities=%d rollbacks=%d (+%d in window, max depth %d) desyncs=%d"),
+            CurrentFrame, RegisteredEntities.Num(), RollbackCount, RollbackCount - TelemetryLastRollbackCount, TelemetryMaxDepth, DesyncCount);
+        TelemetryLastRollbackCount = RollbackCount;
+        TelemetryMaxDepth = 0;
+    }
 }
 
 void URollbackManager::SimulateFrame(int32 Frame)
@@ -137,7 +181,7 @@ void URollbackManager::RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame)
     TMap<FString, TMap<int32, int32>> PreRollbackChecksums;
     for (auto& Entity : RegisteredEntities)
     {
-        URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject());
+        const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
         if (!StateComp) continue;
 
         FString EntityName = StateComp->GetName();
@@ -160,6 +204,8 @@ void URollbackManager::RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame)
     LastRollbackFramesReplayed = CurrentFrame - Frame;
     LastRollbackRestoredStates = 0;
     LastRollbackSavedStates = 0;
+    TelemetryMaxDepth = FMath::Max(TelemetryMaxDepth, LastRollbackFramesReplayed);
+    UE_LOG(LogRollbackCore, Verbose, TEXT("Rollback to frame %d (depth %d)."), Frame, LastRollbackFramesReplayed);
 
     for (auto& Entity : RegisteredEntities)
     {
@@ -179,7 +225,7 @@ void URollbackManager::RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame)
         {
             for (auto& Entity : RegisteredEntities)
             {
-                URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject());
+                const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
                 if (!StateComp) continue;
 
                 FString EntityName = StateComp->GetName();
@@ -226,6 +272,76 @@ void URollbackManager::RollbackToFrame(int32 Frame, int32 EarliestMismatchFrame)
     }
 }
 
+uint32 URollbackManager::ComputeStateChecksum(int32 Frame) const
+{
+    // SaveGame bytes only: the snapshot transform is captured from engine components, whose
+    // storage passes through cached, tolerance-gated conversions and is not bit-stable.
+    // Authoritative transform state must live in SaveGame properties.
+    // Wrapping sum of per-entity CRCs so peers with different registration order still agree.
+    uint32 Sum = 0;
+    for (const TScriptInterface<IRollbackEntity>& Entity : RegisteredEntities)
+    {
+        const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
+        if (!StateComp)
+        {
+            continue;
+        }
+
+        const FRollbackFrameState* State = StateComp->StateBuffer.Find(Frame);
+        if (!State)
+        {
+            continue;
+        }
+
+        Sum += State->ActorData.Num() > 0
+            ? FCrc::MemCrc32(State->ActorData.GetData(), State->ActorData.Num())
+            : 0;
+    }
+    return Sum;
+}
+
+void URollbackManager::HandleStateChecksumMismatch(int32 Frame, int32 LocalChecksum, int32 RemoteChecksum)
+{
+    DesyncCount++;
+    LastDesyncFrame = Frame;
+    OnDesyncDetected.Broadcast(Frame, TEXT("CrossPeer"), LocalChecksum ^ RemoteChecksum);
+
+    // Once diverged every later frame mismatches too; only the first one is diagnostic.
+    if (DesyncCount > 1)
+    {
+        return;
+    }
+    FirstDesyncFrame = Frame;
+
+    // Full precision: cross-peer divergence regularly starts below display precision.
+    for (const FRollbackDebugFrameRecord& Record : GetDebugFrameRecords(Frame))
+    {
+        UE_LOG(LogRollbackCore, Error, TEXT("  %s: loc=(%.17g, %.17g, %.17g) vel=(%.17g, %.17g, %.17g) rot=(%.17g, %.17g, %.17g) bytes=%d crc=%08X input[btn=%d axes=(%.17g, %.17g)]"),
+            *Record.EntityName,
+            Record.Location.X, Record.Location.Y, Record.Location.Z,
+            Record.Velocity.X, Record.Velocity.Y, Record.Velocity.Z,
+            Record.Rotation.Pitch, Record.Rotation.Yaw, Record.Rotation.Roll,
+            Record.SavedByteCount, static_cast<uint32>(Record.SavedChecksum),
+            Record.Input.Buttons, Record.Input.Axes.X, Record.Input.Axes.Y);
+    }
+
+    ensureAlwaysMsgf(false, TEXT("Cross-peer desync at frame %d (local %08X != remote %08X). The frame is past every correction window and cannot be repaired."),
+        Frame, static_cast<uint32>(LocalChecksum), static_cast<uint32>(RemoteChecksum));
+
+    if (bHaltOnDesync)
+    {
+        bHaltedOnDesync = true;
+        if (UWorld* World = GetWorld())
+        {
+            if (APlayerController* PC = World->GetFirstPlayerController())
+            {
+                PC->SetPause(true);
+            }
+        }
+        UE_LOG(LogRollbackCore, Error, TEXT("Simulation halted at frame %d; both peers keep their state buffers for inspection."), CurrentFrame);
+    }
+}
+
 void URollbackManager::DrawDebugState(int32 Frame)
 {
     UWorld* World = GetWorld();
@@ -233,11 +349,10 @@ void URollbackManager::DrawDebugState(int32 Frame)
 
     for (auto& Entity : RegisteredEntities)
     {
-        URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject());
-        if (StateComp && StateComp->StateBuffer.Contains(Frame))
+        const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
+        if (const FRollbackFrameState* State = StateComp ? StateComp->StateBuffer.Find(Frame) : nullptr)
         {
-            FRollbackFrameState& State = StateComp->StateBuffer[Frame];
-            DrawDebugBox(World, State.Location, FVector(50.f), State.Rotation, FColor::Cyan, false, 1.0f, 0, 2.f);
+            DrawDebugBox(World, State->Location, FVector(50.f), State->Rotation, FColor::Cyan, false, 1.0f, 0, 2.f);
         }
     }
 }
@@ -248,7 +363,7 @@ TArray<FRollbackDebugFrameRecord> URollbackManager::GetDebugFrameRecords(int32 F
 
     for (const TScriptInterface<IRollbackEntity>& Entity : RegisteredEntities)
     {
-        const URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject());
+        const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
         if (!StateComp)
         {
             continue;
@@ -289,7 +404,7 @@ TArray<int32> URollbackManager::GetAvailableDebugFrames() const
     TSet<int32> UniqueFrames;
     for (const TScriptInterface<IRollbackEntity>& Entity : RegisteredEntities)
     {
-        const URollbackStateComponent* StateComp = Cast<URollbackStateComponent>(Entity.GetObject());
+        const URollbackStateComponent* StateComp = ResolveStateComp(Entity);
         if (!StateComp)
         {
             continue;

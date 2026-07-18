@@ -2,6 +2,8 @@
 
 #include "RollbackCore.h"
 
+DEFINE_LOG_CATEGORY(LogRollbackCore);
+
 #define LOCTEXT_NAMESPACE "FRollbackCoreModule"
 
 void FRollbackCoreModule::StartupModule()

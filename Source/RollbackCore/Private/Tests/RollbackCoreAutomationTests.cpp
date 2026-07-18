@@ -429,6 +429,14 @@ bool FRollbackPeerDisconnectTest::RunTest(const FString& Parameters)
     Error.Reset();
     TestTrue(TEXT("B connects to A"), NetB->ConnectToPeer(1, TEXT("127.0.0.1"), BasePort, Error));
 
+    // B's hello reaches A only once A pumps its socket.
+    for (int32 Attempt = 0; Attempt < 30 && !NetA->IsConnectedToPeer(); ++Attempt)
+    {
+        FPlatformProcess::Sleep(0.01f);
+        NetB->FlushTransport();
+        NetA->FlushTransport();
+    }
+
     TestTrue(TEXT("A is connected after B joins"), NetA->IsConnectedToPeer());
 
     NetB->StopTransport();

@@ -18,6 +18,7 @@ DECLARE_DYNAMIC_MULTICAST_DELEGATE_OneParam(FRollbackTransportErrorSignature, co
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRollbackRemoteInputReceivedSignature, int32, PlayerId, int32, Frame, FRollbackInput, Input);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FRollbackPeerDisconnectedSignature, int32, PlayerId, const FString&, Reason);
 DECLARE_DYNAMIC_MULTICAST_DELEGATE_TwoParams(FRollbackPeerMaxRetriesSignature, int32, PlayerId, int32, FailedSequence);
+DECLARE_DYNAMIC_MULTICAST_DELEGATE_ThreeParams(FRollbackChecksumMismatchSignature, int32, Frame, int32, LocalChecksum, int32, RemoteChecksum);
 
 UCLASS()
 class ROLLBACKCORE_API URollbackNetSubsystem : public UWorldSubsystem
@@ -81,6 +82,14 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Rollback|Network|Debug", meta = (DevelopmentOnly))
     void FlushTransport();
 
+    /** Records the local sim checksum for a finalized frame, streams it to all peers, and
+        compares it against any checksum already received for that frame. */
+    void SubmitLocalStateChecksum(int32 Frame, uint32 Checksum);
+
+    /** Drops all stored checksums and ignores frames below MinValidFrame from now on.
+        Call whenever the shared timeline is (re)based. */
+    void ResetStateChecksums(int32 MinValidFrame);
+
     UFUNCTION(BlueprintPure, Category = "Rollback|Performance")
     FRollbackPerformanceStats GetPerformanceStats() const { return PerfStats; }
 
@@ -98,6 +107,10 @@ public:
 
     UPROPERTY(BlueprintAssignable, Category = "Rollback|Network")
     FRollbackPeerMaxRetriesSignature OnPeerMaxRetriesExceeded;
+
+    /** Fired when a finalized frame's state checksum differs from the peer's — a confirmed cross-peer desync. */
+    UPROPERTY(BlueprintAssignable, Category = "Rollback|Desync")
+    FRollbackChecksumMismatchSignature OnStateChecksumMismatch;
 
 private:
     struct FPendingReliablePacket
@@ -160,6 +173,8 @@ private:
     bool SendHeartbeat(FRemotePeer& Peer);
     bool SendAck(FRemotePeer& Peer);
     bool SendInputPacket(FRemotePeer& Peer, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable);
+    bool SendChecksumPacket(FRemotePeer& Peer, int32 Frame, uint32 Checksum);
+    void CompareStateChecksums(int32 Frame);
     bool SendPacket(FRemotePeer& Peer, uint8 PacketType, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable);
     bool SendTimestampPacket(FRemotePeer& Peer, uint8 PacketType, double TimestampSeconds);
     bool SendRawPacket(const TArray<uint8>& Payload, TSharedRef<FInternetAddr> Destination, bool bApplySimulation);
@@ -193,6 +208,11 @@ private:
 
     TMap<int32, TMap<int32, FRollbackInput>> RemoteInputBuffer;
     TMap<int32, FRollbackInput> LocalInputHistory;
+    TMap<int32, uint32> LocalStateChecksums;
+    TMap<int32, uint32> RemoteStateChecksums;
+    int32 ChecksumMinValidFrame = 0;
+    int32 FirstChecksumMismatchFrame = -1;
+    double LastChecksumMismatchLogTime = 0.0;
     TArray<FDelayedPacket> DelayedIncomingPackets;
     TArray<FDelayedPacket> DelayedOutgoingPackets;
 

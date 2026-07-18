@@ -1,6 +1,7 @@
 // Copyright (c) 2026 GregOrigin. All Rights Reserved.
 
 #include "RollbackNetSubsystem.h"
+#include "RollbackCore.h"
 #include "RollbackStateComponent.h"
 
 #include "AddressInfoTypes.h"
@@ -24,7 +25,11 @@ namespace RollbackNet
         Heartbeat = 4,
         Ping = 5,
         Pong = 6,
+        Checksum = 7,
     };
+
+    // Frames of checksum history kept for cross-peer comparison.
+    static constexpr int32 ChecksumHistoryFrames = 600;
 
     static constexpr double PingIntervalSeconds = 0.25;
     static constexpr double LossWindowSeconds = 2.0;
@@ -64,6 +69,10 @@ bool URollbackNetSubsystem::StartUdpPeer(const FRollbackTransportConfig& InConfi
     PerfBytesReceivedLastWindow = 0;
     PerfLastBandwidthTime = FPlatformTime::Seconds();
     PerfRollbackFrameTimestamps.Reset();
+    LocalStateChecksums.Reset();
+    RemoteStateChecksums.Reset();
+    ChecksumMinValidFrame = 0;
+    FirstChecksumMismatchFrame = -1;
 
     const FName RequestedSubsystem = Config.SocketSubsystemName.IsNone() ? PLATFORM_SOCKETSUBSYSTEM : Config.SocketSubsystemName;
     SocketSubsystem = ISocketSubsystem::Get(RequestedSubsystem);
@@ -104,6 +113,9 @@ bool URollbackNetSubsystem::StartUdpPeer(const FRollbackTransportConfig& InConfi
     TSharedRef<FInternetAddr> BoundAddress = SocketSubsystem->CreateInternetAddr();
     Socket->GetAddress(*BoundAddress);
     Config.LocalPort = BoundAddress->GetPort();
+
+    UE_LOG(LogRollbackCore, Display, TEXT("Transport started on UDP %d (redundancy %d frames, packet-loss sim %s)."),
+        Config.LocalPort, Config.InputRedundancyFrames, Config.bEnablePacketLossSimulation ? TEXT("on") : TEXT("off"));
 
     if (!Config.RemoteHost.IsEmpty() && Config.RemotePort > 0)
     {
@@ -533,6 +545,7 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
         Peers.Add(MoveTemp(NewPeer));
         Peer = &Peers.Last();
         Stats.ConnectedPeerCount = Peers.Num();
+        UE_LOG(LogRollbackCore, Display, TEXT("Accepted peer %s."), *Sender->ToString(true));
         OnTransportConnected.Broadcast(Sender->ToString(true));
     }
 
@@ -601,6 +614,21 @@ void URollbackNetSubsystem::ProcessIncomingPayload(const TArray<uint8>& Payload,
             {
                 Peer->MeasuredPingMs = Peer->MeasuredPingMs < 0.0f ? SampleMs : FMath::Lerp(Peer->MeasuredPingMs, SampleMs, 0.25f);
             }
+        }
+        return;
+    }
+
+    if (PacketType == static_cast<uint8>(RollbackNet::EWirePacketType::Checksum))
+    {
+        int32 Frame = -1;
+        uint32 Checksum = 0;
+        Reader << Frame;
+        Reader << Checksum;
+        if (!Reader.IsError() && Frame >= ChecksumMinValidFrame)
+        {
+            RemoteStateChecksums.Add(Frame, Checksum);
+            RemoteStateChecksums.Remove(Frame - RollbackNet::ChecksumHistoryFrames);
+            CompareStateChecksums(Frame);
         }
         return;
     }
@@ -711,6 +739,7 @@ void URollbackNetSubsystem::CheckPeerTimeouts(double NowSeconds)
         if (Peer.bConnected && (NowSeconds - Peer.LastActivityTime) >= static_cast<double>(Config.PeerTimeoutSeconds))
         {
             const int32 DisconnectedPlayerId = Peer.PlayerId;
+            UE_LOG(LogRollbackCore, Warning, TEXT("Peer %d timed out (no activity for %.1f s)."), DisconnectedPlayerId, Config.PeerTimeoutSeconds);
             OnPeerDisconnected.Broadcast(DisconnectedPlayerId, TEXT("Peer timed out (no activity)."));
             Peers.RemoveAtSwap(i);
             Stats.ConnectedPeerCount = Peers.Num();
@@ -794,6 +823,95 @@ bool URollbackNetSubsystem::SendAck(FRemotePeer& Peer)
 bool URollbackNetSubsystem::SendInputPacket(FRemotePeer& Peer, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable)
 {
     return SendPacket(Peer, static_cast<uint8>(RollbackNet::EWirePacketType::Input), InputFrames, bReliable);
+}
+
+void URollbackNetSubsystem::SubmitLocalStateChecksum(int32 Frame, uint32 Checksum)
+{
+    if (!Socket || Peers.Num() == 0 || Frame < ChecksumMinValidFrame)
+    {
+        return;
+    }
+
+    LocalStateChecksums.Add(Frame, Checksum);
+    LocalStateChecksums.Remove(Frame - RollbackNet::ChecksumHistoryFrames);
+
+    for (FRemotePeer& Peer : Peers)
+    {
+        if (Peer.bConnected && Peer.Endpoint.IsValid())
+        {
+            SendChecksumPacket(Peer, Frame, Checksum);
+        }
+    }
+
+    CompareStateChecksums(Frame);
+}
+
+void URollbackNetSubsystem::ResetStateChecksums(int32 MinValidFrame)
+{
+    LocalStateChecksums.Reset();
+    RemoteStateChecksums.Reset();
+    ChecksumMinValidFrame = MinValidFrame;
+    FirstChecksumMismatchFrame = -1;
+    UE_LOG(LogRollbackCore, Display, TEXT("State checksum stream reset; comparing frames >= %d."), MinValidFrame);
+}
+
+bool URollbackNetSubsystem::SendChecksumPacket(FRemotePeer& Peer, int32 Frame, uint32 Checksum)
+{
+    if (!Peer.Endpoint.IsValid())
+    {
+        return false;
+    }
+
+    TArray<uint8> Payload;
+    FMemoryWriter Writer(Payload);
+
+    uint32 Magic = RollbackNet::PacketMagic;
+    uint8 Version = RollbackNet::PacketVersion;
+    uint8 PacketType = static_cast<uint8>(RollbackNet::EWirePacketType::Checksum);
+    uint32 Sequence = Peer.NextOutgoingSequence++;
+    uint32 AckSequence = Peer.HighestContiguousReceivedSequence;
+    int32 InputCount = 0;
+
+    Writer << Magic;
+    Writer << Version;
+    Writer << PacketType;
+    Writer << Sequence;
+    Writer << AckSequence;
+    Writer << InputCount;
+    Writer << Frame;
+    Writer << Checksum;
+
+    Stats.LastSentSequence = Sequence;
+    Peer.PacketsSentToPeer++;
+    return SendRawPacket(Payload, Peer.Endpoint.ToSharedRef(), true);
+}
+
+void URollbackNetSubsystem::CompareStateChecksums(int32 Frame)
+{
+    const uint32* Local = LocalStateChecksums.Find(Frame);
+    const uint32* Remote = RemoteStateChecksums.Find(Frame);
+    if (!Local || !Remote || *Local == *Remote)
+    {
+        return;
+    }
+
+    PerfStats.DesyncCount++;
+
+    // The first mismatch is the interesting one; later frames inherit the divergence.
+    const double NowSeconds = FPlatformTime::Seconds();
+    const bool bFirstMismatch = FirstChecksumMismatchFrame < 0;
+    if (bFirstMismatch)
+    {
+        FirstChecksumMismatchFrame = Frame;
+    }
+    if (bFirstMismatch || NowSeconds - LastChecksumMismatchLogTime >= 1.0)
+    {
+        LastChecksumMismatchLogTime = NowSeconds;
+        UE_LOG(LogRollbackCore, Error, TEXT("DESYNC: frame %d state checksum local %08X != remote %08X (first mismatch at frame %d)."),
+            Frame, *Local, *Remote, FirstChecksumMismatchFrame);
+    }
+
+    OnStateChecksumMismatch.Broadcast(Frame, static_cast<int32>(*Local), static_cast<int32>(*Remote));
 }
 
 bool URollbackNetSubsystem::SendPacket(FRemotePeer& Peer, uint8 PacketType, const TArray<FNetworkInputFrame>& InputFrames, bool bReliable)

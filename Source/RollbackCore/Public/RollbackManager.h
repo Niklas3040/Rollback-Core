@@ -73,6 +73,10 @@ public:
     UFUNCTION(BlueprintCallable, Category = "Rollback|Debug")
     void DrawDebugState(int32 Frame);
 
+    // Order-independent checksum over every entity's saved state for Frame
+    // (SaveGame bytes plus the raw transform/velocity bits). 0 when no state exists.
+    uint32 ComputeStateChecksum(int32 Frame) const;
+
     UFUNCTION(BlueprintCallable, Category = "Rollback|Debug")
     TArray<FRollbackDebugFrameRecord> GetDebugFrameRecords(int32 Frame) const;
 
@@ -133,19 +137,44 @@ public:
     UPROPERTY(BlueprintReadOnly, Category = "Rollback|Desync")
     int32 LastDesyncFrame = -1;
 
+    UPROPERTY(BlueprintReadOnly, Category = "Rollback|Desync")
+    int32 FirstDesyncFrame = -1;
+
+    // Ensure + freeze the fixed-step loop and pause the world on the first cross-peer desync.
+    // Checksums are only compared once a frame is beyond every correction window, so any
+    // mismatch that fires is already permanent.
+    UPROPERTY(EditAnywhere, BlueprintReadWrite, Category = "Rollback|Desync")
+    bool bHaltOnDesync = true;
+
+    UPROPERTY(BlueprintReadOnly, Category = "Rollback|Desync")
+    bool bHaltedOnDesync = false;
+
     UPROPERTY(BlueprintAssignable, Category = "Rollback|Desync")
     FRollbackDesyncSignature OnDesyncDetected;
 
 private:
     void SimulateFrame(int32 Frame);
 
+    UFUNCTION()
+    void HandleStateChecksumMismatch(int32 Frame, int32 LocalChecksum, int32 RemoteChecksum);
+
     UPROPERTY()
     TArray<TScriptInterface<IRollbackEntity>> RegisteredEntities;
-    
+
     FTSTicker::FDelegateHandle TickHandle;
     bool TickFunction(float DeltaTime);
-    
+
     float Accumulator = 0.0f;
     float FixedTimeStep = 1.0f / 60.0f;
     bool bIsReplayingRollback = false;
+
+    // Frames a state must age before its checksum goes on the wire. Must exceed the
+    // deepest input correction the game performs and stay under the snapshot buffer size.
+    static constexpr int32 StateChecksumLagFrames = 45;
+
+    // Sim frames between telemetry log lines (~5 s at 60 Hz).
+    static constexpr int32 TelemetryLogIntervalFrames = 300;
+
+    int32 TelemetryLastRollbackCount = 0;
+    int32 TelemetryMaxDepth = 0;
 };
